@@ -1,6 +1,7 @@
 # Greenshot Image Sorter
 
-A lightweight, highly robust background Python script that monitors a specified directory for new Greenshot screenshots and automatically sorts them into dedicated folders based on customizable priority rules.
+A lightweight, highly robust background Python script that monitors a specified directory for new Greenshot screenshots (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`) and automatically sorts them into dedicated folders based on customizable priority rules.
+
 
 ## Features
 
