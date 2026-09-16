@@ -8,12 +8,9 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # Configuration
-SOURCE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "GREENSHOT DB"))
-if not os.path.exists(SOURCE_DIR):
-    SOURCE_DIR = r"C:\Tools\GREENSHOT DB"
-
-UNSORTED_DIR = os.path.join(SOURCE_DIR, "Unsorted")
-LOG_FILE = os.path.join(os.path.dirname(__file__), "greenshot_sorter.log")
+SOURCE_DIR = os.getenv("GREENSHOT_SOURCE_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "GREENSHOT DB")))
+UNSORTED_DIR = os.getenv("GREENSHOT_UNSORTED_DIR", os.path.join(SOURCE_DIR, "Unsorted"))
+LOG_FILE = os.getenv("GREENSHOT_LOG_FILE", os.path.join(os.path.dirname(__file__), "greenshot_sorter.log"))
 
 # Custom Keywords Dictionary (case-insensitive search -> destination folder)
 CUSTOM_KEYWORDS = {
