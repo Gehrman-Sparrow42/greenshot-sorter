@@ -26,3 +26,7 @@ Thumbs.db
 # Local routing preferences and archive preview reports
 /corrections.json
 /artifacts/
+
+# Persistent local Flash queue
+/.flash_batch.json
+/.flash-batch-*.tmp

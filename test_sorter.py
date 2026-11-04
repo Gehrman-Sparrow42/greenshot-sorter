@@ -4,14 +4,12 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import sorter
-from routing import Route, Routing
+from routing import Routing
 
 
 class WatcherTests(unittest.TestCase):
@@ -65,35 +63,17 @@ class WatcherTests(unittest.TestCase):
             sorter.fingerprint(path),
         )
 
-    def test_duplicate_events_and_local_work_during_flash(self):
-        waiting, release = threading.Event(), threading.Event()
-
-        def resolve(title, path, route):
-            waiting.set()
-            release.wait(10)
-            return Route(("Browser", "Docs"), "synthetic response")
-
+    def test_unresolved_is_filed_and_queued_without_immediate_flash(self):
         flash = Mock()
-        flash.resolve.side_effect = resolve
         inbox = sorter.Inbox(self.root, self.unsorted, self.router, flash)
         unknown = self.capture("Unrecognized - Firefox")
-        try:
+        with patch.object(sorter.daily_batch, "enqueue") as enqueue:
             inbox.submit(unknown)
             inbox.scan()
-            self.assertTrue(waiting.wait(5))
-            known = self.capture("shadPS4")
-            inbox.scan()
-            target = self.root / "Bloodborne" / known.name
-            deadline = time.monotonic() + 5
-            while not target.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(target.exists())
-            self.assertTrue(unknown.exists())
-        finally:
-            release.set()
             inbox.close()
-        self.assertTrue((self.root / "Browser" / "Docs" / unknown.name).exists())
-        flash.resolve.assert_called_once()
+        enqueue.assert_called_once()
+        flash.resolve.assert_not_called()
+        self.assertTrue(enqueue.call_args.args[1].exists())
 
     def test_preview_read_only_and_report_outside_archive(self):
         path = self.capture("shadPS4")

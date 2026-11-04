@@ -375,6 +375,53 @@ class FlashClassifier:
             return None
         return Route(parts, reason)
 
+    def prepare_titles(self, titles):
+        """Classify unique titles in groups, retaining per-title evidence checks."""
+        unique = list(dict.fromkeys(titles))
+        try:
+            for start in range(0, len(unique), 30):
+                group = unique[start : start + 30]
+                prompt = (
+                    PROMPT + "\nFor each title below, return an array of objects, "
+                    "each containing its numeric id and the requested fields. "
+                    "Use only evidence from that title for its object.\nTitles: "
+                    + json.dumps(
+                        [{"id": n, "title": title} for n, title in enumerate(group)],
+                        ensure_ascii=False,
+                    )
+                )
+                response = self._query(prompt).strip()
+                if response.startswith("```"):
+                    response = re.sub(
+                        r"^```(?:json)?\s*|\s*```$", "", response, flags=re.IGNORECASE
+                    )
+                data = json.loads(response)
+                if not isinstance(data, list) or len(data) != len(group):
+                    raise ValueError("Invalid bulk title response")
+                parsed = {}
+                for item in data:
+                    if not isinstance(item, dict) or type(item.get("id")) is not int:
+                        raise ValueError("Invalid bulk title id")
+                    index = item["id"]
+                    if index < 0 or index >= len(group) or index in parsed:
+                        raise ValueError("Duplicate or unknown bulk title id")
+                    parsed[index] = _parse(json.dumps(item), group[index])
+                for index, title in enumerate(group):
+                    _remember(self.title_cache, title, parsed[index])
+            return True
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            RuntimeError,
+            TimeoutError,
+        ) as exc:
+            logging.getLogger(__name__).warning(
+                "Flash bulk title pass failed (%s)", type(exc).__name__
+            )
+            return False
+
     def resolve(self, title: str, image_path: Path, local: Route) -> Route:
         if not local.unresolved or time.monotonic() < self.retry_at:
             return local

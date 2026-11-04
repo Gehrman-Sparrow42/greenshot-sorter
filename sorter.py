@@ -24,6 +24,7 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+import daily_batch
 from routing import Route, Routing
 
 logger = logging.getLogger(__name__)
@@ -237,7 +238,6 @@ class Inbox(FileSystemEventHandler):
             self.pending.discard(path)
 
     def process(self, path):
-        delegated = False
         try:
             if not regular_entry(path):
                 return
@@ -246,38 +246,30 @@ class Inbox(FileSystemEventHandler):
                 logger.warning("File still being written; will retry: %s", path.name)
                 return
             title, route = classify_file(path, self.router)
-            if route.unresolved and self.flash:
-                self.ai_worker.submit(
-                    self.resolve_and_move, path, expected, title, route
-                )
-                delegated = True
-            else:
-                self.move(path, expected, route)
-        except FileNotFoundError:
-            pass  # Duplicate/delayed event for a capture that has moved.
-        except Exception:
-            logger.exception("Could not process %s; will retry", path.name)
-        finally:
-            if not delegated:
-                self.finish(path)
-
-    def resolve_and_move(self, path, expected, title, route):
-        try:
-            if fingerprint(path) != expected:
-                return
-            try:
-                route = self.flash.resolve(title, path, route)
-            except Exception:
-                logger.exception(
-                    "Flash unavailable; using local route for %s", path.name
-                )
-            self.move(path, expected, route)
+            target = self.move(path, expected, route)
+            if target and route.unresolved:
+                daily_batch.enqueue(self.root, target, title, route)
         except FileNotFoundError:
             pass
         except Exception:
-            logger.exception("Could not file %s; will retry", path.name)
+            logger.exception("Could not process %s; will retry", path.name)
         finally:
             self.finish(path)
+
+    def schedule_batch(self):
+        if not self.flash:
+            return
+        daily_batch.recover(self.root, self.unsorted, self.router)
+        pending = daily_batch.claim(self.root)
+        if pending is not None:
+            self.ai_worker.submit(
+                daily_batch.run,
+                self.root,
+                self.unsorted,
+                self.router,
+                pending,
+                self.flash,
+            )
 
     def move(self, path, expected, route):
         target = move_capture(
@@ -285,6 +277,7 @@ class Inbox(FileSystemEventHandler):
         )
         if target:
             logger.info("Moved %s -> %s (%s)", path.name, target, route.reason)
+        return target
 
     def close(self):
         self.local_worker.shutdown(wait=True)
@@ -320,10 +313,11 @@ def watch(root, unsorted, router):
     observer.start()
     try:
         logger.info(
-            "Watching %s (Flash %s)", root, "enabled" if enabled else "disabled"
+            "Watching %s (daily Flash %s)", root, "enabled" if enabled else "disabled"
         )
         while True:
             inbox.scan()
+            inbox.schedule_batch()
             time.sleep(30)  # Recover from locks, replacements and missed OS events.
     except KeyboardInterrupt:
         pass
@@ -345,12 +339,19 @@ def main():
     parser.add_argument(
         "--report", type=Path, help="new preview CSV outside the archive"
     )
+    parser.add_argument(
+        "--run-flash-batch",
+        action="store_true",
+        help="process the pending queue now and mark today as run",
+    )
     args = parser.parse_args()
     root = (args.preview_archive or SOURCE_DIR).resolve()
     unsorted = Path(os.getenv("GREENSHOT_UNSORTED_DIR", root / "Unsorted")).resolve()
     if root.is_relative_to(unsorted):
         parser.error("Unsorted must be a subfolder of, or separate from, the inbox")
     corrections = Path(os.getenv("GREENSHOT_CORRECTIONS", PROJECT / "corrections.json"))
+    if args.preview_archive and args.run_flash_batch:
+        parser.error("--run-flash-batch cannot be combined with preview")
     if args.preview_archive:
         if not root.is_dir():
             parser.error("archive directory does not exist")
@@ -386,7 +387,17 @@ def main():
                 format="%(asctime)s - %(levelname)s - %(message)s",
             )
             router = Routing(root, corrections if corrections.exists() else None)
-            watch(root, unsorted, router)
+            if args.run_flash_batch:
+                from flash_classifier import FlashClassifier
+
+                pending = daily_batch.claim(root, force=True)
+                daily_batch.run(
+                    root, unsorted, router, pending, FlashClassifier(router)
+                )
+            else:
+                watch(root, unsorted, router)
+        else:
+            parser.error("watcher or batch already running for this inbox")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from PIL import Image
 
@@ -95,6 +96,28 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(
             result.parts, ("Browser", "Manga", "Moonlit Teapot", "Episode 8")
         )
+
+    def test_bulk_titles_share_one_request_and_validate_evidence(self):
+        response = []
+        for index, subject in enumerate(("Example", "Another")):
+            item = json.loads(answer(subject=subject, category="Gaming"))
+            item["id"] = index
+            response.append(item)
+        request = Mock(return_value=json.dumps(response))
+        classifier = FlashClassifier(Mock(), request=request)
+        self.assertTrue(classifier.prepare_titles(["Example", "Another", "Example"]))
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(classifier.title_cache["Example"]["subject"], "Example")
+        self.assertEqual(classifier.title_cache["Another"]["subject"], "Another")
+
+    def test_bulk_rejects_duplicate_ids(self):
+        item = json.loads(answer(subject="Example", category="Gaming"))
+        item["id"] = 0
+        classifier = FlashClassifier(
+            Mock(), request=Mock(return_value=json.dumps([item, item]))
+        )
+        self.assertFalse(classifier.prepare_titles(["Example", "Another"]))
+        self.assertEqual(len(classifier.title_cache), 0)
 
     def test_generic_subject_requires_image_and_cannot_be_used_as_subject(self):
         calls = []

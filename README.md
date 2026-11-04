@@ -40,7 +40,11 @@ Copy `corrections.example.json` to `corrections.json`, edit it, then restart the
 
 ## Flash fallback
 
-The watcher tries local rules first. An unresolved capture goes to a separate worker so new, recognizable screenshots can still be filed. The worker uses the official signed-in Antigravity CLI and selects `gemini-3.8-flash-medium`. It asks about the title before attaching an image. For unresolved inputs, visible labels in the screenshot can supply evidence. The Python sorter validates the proposed fields and chooses the destination. If the service times out or is unavailable, the capture uses its local fallback.
+The watcher files each capture immediately using local rules. Unresolved captures are recorded in a local persistent queue and revisited once per day after midnight in Istanbul (UTC+3). If the watcher was stopped at midnight, it catches up when next started. A separate worker keeps local filing responsive. The last run date is saved, so restarting the watcher does not repeat the run that day. Unresolved or failed items remain queued for the next daily run.
+
+A run groups up to 30 unique titles per request using the official signed-in Antigravity CLI and `gemini-3.8-flash-medium`. Captures needing visual evidence may require additional image-specific requests during that run. A daily batch is therefore a scheduled collection of requests, not necessarily a single model call. Results are validated locally and files are moved without overwriting existing captures. The queue and run date are stored in `.flash_batch.json` beside the script, excluded from Git.
+
+To run the pending queue immediately, stop the watcher and run `python sorter.py --run-flash-batch`. This marks today as run. The command does not scan or enqueue the archive. Windows allows only one watcher or manual batch for the same inbox at a time.
 
 Archive preview and unit tests run without an Antigravity account. To use live Flash, install the official Windows CLI and sign in interactively under the same Windows user that runs the watcher. For local-only sorting, set `GREENSHOT_FLASH=0` in the launch environment.
 
@@ -54,6 +58,6 @@ The sorter reads Windows environment variables at startup. `.env.example` lists 
 | `GREENSHOT_UNSORTED_DIR` | `Unsorted` under the inbox |
 | `GREENSHOT_LOG_FILE` | `greenshot_sorter.log` beside the script |
 | `GREENSHOT_CORRECTIONS` | `corrections.json` beside the script, when present |
-| `GREENSHOT_FLASH` | `1` (enabled for live ambiguous captures) |
+| `GREENSHOT_FLASH` | `1` (enabled for daily queued captures) |
 
 Install `requirements.txt` in the Python environment running the launcher. Run the offline regression suite from the project directory with `python -m unittest discover -v`.
