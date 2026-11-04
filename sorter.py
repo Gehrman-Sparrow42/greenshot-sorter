@@ -1,305 +1,392 @@
+"""Watch the Greenshot inbox, or preview local routing across an existing archive."""
+
+import argparse
+import csv
+import ctypes
+import errno
+import hashlib
+import logging
 import os
-import time
 import re
 import shutil
-import logging
+import stat
+import sys
+import tempfile
+import threading
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from ctypes import wintypes
 from logging.handlers import RotatingFileHandler
-from watchdog.observers import Observer
+from pathlib import Path
+
 from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
-# Configuration
-SOURCE_DIR = os.getenv("GREENSHOT_SOURCE_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "GREENSHOT DB")))
-UNSORTED_DIR = os.getenv("GREENSHOT_UNSORTED_DIR", os.path.join(SOURCE_DIR, "Unsorted"))
-LOG_FILE = os.getenv("GREENSHOT_LOG_FILE", os.path.join(os.path.dirname(__file__), "greenshot_sorter.log"))
+from routing import Route, Routing
 
-# Custom Keywords Dictionary (case-insensitive search -> destination folder)
-CUSTOM_KEYWORDS = {
-    "Bloodborne": "Bloodborne",
-    "shadPS4": "Bloodborne",
-    "V Rising": "VRising",
-    "VRising": "VRising",
-    "Persona 5 Royal": "Persona 5 Royal",
-}
+logger = logging.getLogger(__name__)
 
-# Browser & Web Platform Keywords (routes to 'Browser Screenshots')
-BROWSER_KEYWORDS = [
-    "Floorp", "Ablaze Fl", "Ablaze Floorp", "Ablaze",
-    "Chrome", "Google Chrome",
-    "Firefox", "Mozilla Firefox",
-    "Edge", "Microsoft Edge",
-    "Opera", "Opera GX",
-    "Brave", "Vivaldi", "Arc",
-    "Zen Browser", "Zen",
-    "Thorium", "LibreWolf", "Waterfox",
-    "YouTube", "Twitch", "TikTok", "Reddit", "Twitter", "X.com", "Wikipedia", "Google Search"
-]
-
-# Manga site & browser suffixes to strip from manga titles
-MANGA_SUFFIXES_TO_STRIP = [
-    "MangaDex", "Opera", "Chrome", "Firefox", "Edge", "Brave", "TikTok",
-    "Floorp", "Ablaze Fl", "Ablaze Floorp", "Ablaze", "Zen Browser", "Zen", "Vivaldi", "Arc",
-    "Asura Scans", "Asura Comic", "Reaper Scans", "Flame Scans", "Flame Comics",
-    "Luminous Scans", "Void Scans", "Drake Scans", "Night Scans", "Surya Scans",
-    "Webtoon", "Webtoons", "Bilibili", "Tapas", "Tappytoon",
-    "MangaPlus", "Bato.to", "Batoto", "Google Search", "YouTube",
-    "Read Online", "ManhuaPlus", "MangaKakalot", "MangaNelo", "Vyvymanga",
-    "MangaReader", "MangaPark", "Kun Manga", "Harimanga", "ToonGod", "Hivetoon"
-]
-
-# Supported Image Extensions
-IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+PROJECT = Path(__file__).resolve().parent
+SOURCE_DIR = Path(os.getenv("GREENSHOT_SOURCE_DIR", PROJECT.parent / "GREENSHOT DB"))
+LOG_FILE = Path(os.getenv("GREENSHOT_LOG_FILE", PROJECT / "greenshot_sorter.log"))
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+CAPTURE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}[_:-]\d{2}[_:-]\d{2}\s*[-_]?\s*(.*)$")
 
 
-def setup_logging():
-    """Configures rotating file logging with UTF-8 support."""
-    os.makedirs(SOURCE_DIR, exist_ok=True)
-    handler = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=3,
-        encoding="utf-8"
+def classify_file(path, router):
+    match = CAPTURE.fullmatch(path.stem)
+    title = match[1].strip() if match else ""
+    if not title:
+        return "", Route((), "Missing Greenshot timestamp or window title")
+    return title, router.classify(title)
+
+
+def destination(root, unsorted, route):
+    if not route.parts:
+        return unsorted
+    folder = root.joinpath(*route.parts).resolve()
+    if not folder.is_relative_to(root) or folder == root:
+        raise ValueError("Route leaves the archive or points back into the inbox")
+    return folder
+
+
+def regular_entry(path):
+    info = path.lstat()
+    return (
+        stat.S_ISREG(info.st_mode)
+        and not getattr(info, "st_file_attributes", 0)
+        & stat.FILE_ATTRIBUTE_REPARSE_POINT
     )
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    # Clear existing handlers if any
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    logger.addHandler(handler)
 
 
-def sanitize_folder_name(name):
-    """Removes illegal Windows characters and cleans leading/trailing punctuation and spaces."""
-    if not name:
-        return ""
-    # Strip illegal OS characters
-    sanitized = re.sub(r'[<>:"/\\|?*]', '', name)
-    # Strip leading/trailing spaces, dots, dashes, underscores, colons
-    sanitized = re.sub(r'[\s\.\-_:]+$', '', sanitized)
-    sanitized = re.sub(r'^[\s\.\-_:]+', '', sanitized)
-    # Collapse multiple consecutive spaces
-    sanitized = re.sub(r'\s+', ' ', sanitized)
-    return sanitized.strip()
-
-
-def get_unique_filename(dest_path, filename):
-    """Appends _1, _2, etc. if the file already exists in the destination."""
-    name, ext = os.path.splitext(filename)
-    counter = 1
-    new_filename = filename
-    while os.path.exists(os.path.join(dest_path, new_filename)):
-        new_filename = f"{name}_{counter}{ext}"
-        counter += 1
-    return new_filename
-
-
-def wait_for_file_release(file_path, timeout=5, delay=0.1):
-    """Waits until the file is fully written and no longer locked by the OS."""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            # Renaming a file to itself is a reliable, non-destructive check on Windows
-            os.rename(file_path, file_path)
-            return True
-        except (PermissionError, OSError):
-            time.sleep(delay)
-    return False
-
-
-def clean_manga_title(title):
-    """Detects and extracts a clean manga/webtoon series name."""
-    # Match Chapter / Episode / Ch / Ep / Vol / Volume / Capitulo / Cap
-    match = re.search(
-        r'(?i)\b(Chapter|Episode|Ch\.?|Ep\.?|Vol\.?|Volume|Capitulo|Cap\.?)\b\s*(\d+[\.\d]*)?\s*(?:[-:_|–—]\s*)?(.*)',
-        title
+def preview(archive, unsorted, router, stream):
+    counts = Counter()
+    writer = csv.writer(stream)
+    writer.writerow(
+        ("filename", "current_folder", "proposed_folder", "local_decision", "reason")
     )
-    if not match:
-        return None
-
-    prefix = title[:match.start()].strip()
-    suffix = match.group(3).strip()
-
-    # Strip common site/junk prefixes from the prefix
-    prefix = re.sub(r'(?i)^\s*(Read|Read\s+Online|Raw)\s+', '', prefix).strip()
-    prefix = re.sub(r'(?i)^\s*\(\s*(Season\s+\d+|S\d+)[^\)]*\)\s*', '', prefix).strip()
-    prefix = re.sub(r'^[\s\-_:_–—]+', '', prefix).strip()
-
-    # Count valid alphabetic characters in the prefix
-    letters_in_prefix = len(re.sub(r'[^a-zA-Z]', '', prefix))
-    if letters_in_prefix >= 2:
-        return sanitize_folder_name(prefix)
-
-    # Fallback to suffix if prefix was junk (e.g. "11 _ ", "(S2)")
-    clean_suffix = suffix
-    strip_pattern = r'(?i)\s*[-|_–—]\s*(' + '|'.join(re.escape(s) for s in MANGA_SUFFIXES_TO_STRIP) + r')\b.*$'
-    while True:
-        new_suffix = re.sub(strip_pattern, '', clean_suffix).strip()
-        if new_suffix == clean_suffix:
-            break
-        clean_suffix = new_suffix
-
-    clean_suffix = re.sub(r'(?i)^\s*(Read|Read\s+Online|Raw)\s+', '', clean_suffix).strip()
-    clean_suffix = re.sub(r'(?i)^\s*\(\s*(Season\s+\d+|S\d+)[^\)]*\)\s*', '', clean_suffix).strip()
-    clean_suffix = sanitize_folder_name(clean_suffix)
-    return clean_suffix if clean_suffix else "Unknown Manga"
-
-
-def clean_potplayer_title(title):
-    """Extracts a clean show/video name from PotPlayer window title."""
-    if "potplayer" not in title.lower():
-        return None
-
-    video_name = re.sub(r'(?i)\s*[-|_–—]?\s*potplayer\s*[-|_–—]?\s*', '', title).strip()
-    video_name = re.sub(r'(?i)\.(mkv|mp4|avi|webm|ts|flv)$', '', video_name).strip()
-
-    clean_show = video_name
-    clean_show = re.sub(r'^\[.*?\]\s*', '', clean_show)  # Strip leading [Group]
-    clean_show = re.sub(r'\s*[\[\(].*?[\]\)]\s*$', '', clean_show)  # Strip trailing tags / quality
-    # Strip episode patterns (e.g., S01E08, Episode 08, E08, 08v2)
-    clean_show = re.sub(r'(?i)\s*[-|_–—]?\s*(S\d+\s*E\d+|Episode\s*\d+|E\d+|\b\d{2,4}v?\d?\b)\s*.*$', '', clean_show).strip()
-    clean_show = sanitize_folder_name(clean_show)
-    return clean_show if clean_show else "Unknown Content"
+    for directory, dirs, names in os.walk(archive):
+        base = Path(directory)
+        dirs[:] = sorted(
+            d
+            for d in dirs
+            if not (
+                getattr((base / d).lstat(), "st_file_attributes", 0)
+                & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            )
+        )
+        for name in sorted(names):
+            path = base / name
+            if path.suffix.lower() not in IMAGE_EXTENSIONS or not regular_entry(path):
+                continue
+            # Our collision suffix is metadata when an original sibling confirms it.
+            stem = re.sub(r"_\d+$", "", path.stem)
+            original = path.with_name(stem + path.suffix)
+            _, route = classify_file(original if original.is_file() else path, router)
+            target = destination(archive, unsorted, route)
+            relative = (
+                target.relative_to(archive)
+                if target.is_relative_to(archive)
+                else target
+            )
+            status = "needs Flash" if route.unresolved else "local"
+            writer.writerow(
+                (name, base.relative_to(archive), relative, status, route.reason)
+            )
+            counts["images"] += 1
+            counts["different folder"] += target != base
+            counts["needs Flash"] += route.unresolved
+    return counts
 
 
-def parse_destination(title):
-    """Determines parent folder and destination folder based on priority rules."""
-    if not title or not title.strip():
-        return None, "Unsorted"
-
-    title = title.strip()
-
-    # Priority 1: Manga & Webtoons
-    manga_name = clean_manga_title(title)
-    if manga_name:
-        return "manga", manga_name
-
-    # Priority 2: PotPlayer
-    potplayer_name = clean_potplayer_title(title)
-    if potplayer_name:
-        return "PotPlayer", potplayer_name
-
-    # Priority 3: Custom Keywords
-    for kw, mapped in CUSTOM_KEYWORDS.items():
-        if kw.lower() in title.lower():
-            return None, mapped
-
-    # Priority 4: Browser & Web Platform Catch-All
-    for browser in BROWSER_KEYWORDS:
-        if browser.lower() in title.lower():
-            return None, "Browser Screenshots"
-
-    # Priority 5: Default Games / Clean Titles
-    # Strip trailing version numbers, trainers, builds, or patches
-    clean_title = re.sub(r'(?i)\s+(v\d[\d\.\-v]*|Plus\s+\d+\s+Trainer.*|Build\s+\d+.*|Patch\s+[\d\.]+.*)$', '', title).strip()
-    clean_title = sanitize_folder_name(clean_title)
-    if not clean_title:
-        return None, "Unsorted"
-
-    return None, clean_title
+def fingerprint(path):
+    info = path.stat()
+    return info.st_ino, info.st_size, info.st_mtime_ns
 
 
-def process_file(file_path):
-    """Processes a newly created or found image according to sorting rules."""
-    filename = os.path.basename(file_path)
-
-    # 0. Strict Prefix Verification
-    # Format: YYYY-MM-DD HH_MM_SS-Window Title.ext (flexible on separators/spacing)
-    prefix_pattern = r'^(\d{4}-\d{2}-\d{2}\s+\d{2}[_\-:]\d{2}[_\-:]\d{2})\s*[-_]?\s*(.*)\.(png|jpg|jpeg|bmp|webp)$'
-    match = re.match(prefix_pattern, filename, re.IGNORECASE)
-
-    if not match:
-        dest_path = UNSORTED_DIR
-        dest_folder_name = "Unsorted"
-    else:
-        title = match.group(2).strip()
-        parent_folder, dest_folder_name = parse_destination(title)
-        if parent_folder:
-            dest_path = os.path.join(SOURCE_DIR, parent_folder, dest_folder_name)
-        else:
-            dest_path = os.path.join(SOURCE_DIR, dest_folder_name)
-
-    os.makedirs(dest_path, exist_ok=True)
-
-    if wait_for_file_release(file_path):
-        new_filename = get_unique_filename(dest_path, filename)
-        dest_file = os.path.join(dest_path, new_filename)
-        try:
-            shutil.move(file_path, dest_file)
-            logging.info(f"Moved: {filename} -> {dest_folder_name}\\{new_filename}")
-        except Exception as e:
-            logging.error(f"Failed to move {filename} to {dest_folder_name}: {e}")
-    else:
-        logging.warning(f"Timeout waiting for file release: {filename}")
+@contextmanager
+def exclude_writers(path):
+    """Keep a Windows handle that allows reading and moving, but excludes writers."""
+    if os.name != "nt":
+        yield
+        return
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_file = kernel.CreateFileW
+    open_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    open_file.restype = wintypes.HANDLE
+    handle = open_file(str(path), 0x80000000, 0x1 | 0x4, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield
+    finally:
+        kernel.CloseHandle(wintypes.HANDLE(handle))
 
 
-class ScreenshotHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if not event.is_directory and event.src_path.lower().endswith(IMAGE_EXTENSIONS):
-            logging.info(f"New file detected: {event.src_path}")
+def stable_capture(path, timeout=5, interval=0.25):
+    previous = None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = fingerprint(path)
+        if current == previous and current[1]:
             try:
-                process_file(event.src_path)
-            except Exception as e:
-                logging.error(f"Unhandled error processing {event.src_path}: {e}")
+                with exclude_writers(path):
+                    return current
+            except PermissionError:
+                pass
+        previous = current
+        time.sleep(interval)
+    return None
+
+
+def publish_unique(source, folder, filename):
+    """Publish within a volume without replacing an existing capture."""
+    suffix = Path(filename).suffix
+    stem = Path(filename).stem
+    index = 0
+    while True:
+        target = folder / (filename if index == 0 else f"{stem}_{index}{suffix}")
+        try:
+            if os.name == "nt":
+                # Windows rename fails if the target already exists.
+                source.rename(target)
+            else:
+                os.link(source, target)
+                source.unlink()
+            return target
+        except FileExistsError:
+            index += 1
+
+
+def move_capture(path, folder, expected):
+    with exclude_writers(path):
+        if not regular_entry(path) or fingerprint(path) != expected:
+            return None  # The inbox is rescanned and will classify the replacement.
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            return publish_unique(path, folder, path.name)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+                raise
+        # An externally configured Unsorted folder can be on another volume.
+        # Finish copying before making the final filename visible.
+        with tempfile.NamedTemporaryFile(
+            dir=folder, prefix=".greenshot-", suffix=".part", delete=False
+        ) as tmp:
+            staging = Path(tmp.name)
+        try:
+            shutil.copy2(path, staging)
+            target = publish_unique(staging, folder, path.name)
+            try:
+                path.unlink()
+            except OSError:
+                # The source still exists. Roll back our copy before the retry.
+                target.unlink()
+                raise
+            return target
+        finally:
+            staging.unlink(missing_ok=True)
+
+
+class Inbox(FileSystemEventHandler):
+    def __init__(self, root, unsorted, router, flash):
+        super().__init__()
+        self.root = root
+        self.unsorted = unsorted
+        self.router = router
+        self.flash = flash
+        self.local_worker = ThreadPoolExecutor(1, thread_name_prefix="greenshot-local")
+        self.ai_worker = ThreadPoolExecutor(1, thread_name_prefix="greenshot-flash")
+        self.pending = set()
+        self.lock = threading.Lock()
+
+    def submit(self, path):
+        path = Path(path)
+        if path.parent != self.root or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            return
+        with self.lock:
+            if path in self.pending:
+                return
+            self.pending.add(path)
+        self.local_worker.submit(self.process, path)
+
+    def scan(self):
+        for path in self.root.iterdir():
+            self.submit(path)
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self.submit(event.src_path)
 
     def on_moved(self, event):
-        if not event.is_directory and event.dest_path.lower().endswith(IMAGE_EXTENSIONS):
-            if os.path.dirname(os.path.abspath(event.dest_path)) == SOURCE_DIR:
-                logging.info(f"File moved into directory: {event.dest_path}")
-                try:
-                    process_file(event.dest_path)
-                except Exception as e:
-                    logging.error(f"Unhandled error processing {event.dest_path}: {e}")
+        if not event.is_directory:
+            self.submit(event.dest_path)
 
+    def finish(self, path):
+        with self.lock:
+            self.pending.discard(path)
 
-def process_existing_files():
-    """Scans the SOURCE_DIR for existing loose image files and processes them."""
-    if not os.path.exists(SOURCE_DIR):
-        return
+    def process(self, path):
+        delegated = False
+        try:
+            if not regular_entry(path):
+                return
+            expected = stable_capture(path)
+            if expected is None:
+                logger.warning("File still being written; will retry: %s", path.name)
+                return
+            title, route = classify_file(path, self.router)
+            if route.unresolved and self.flash:
+                self.ai_worker.submit(
+                    self.resolve_and_move, path, expected, title, route
+                )
+                delegated = True
+            else:
+                self.move(path, expected, route)
+        except FileNotFoundError:
+            pass  # Duplicate/delayed event for a capture that has moved.
+        except Exception:
+            logger.exception("Could not process %s; will retry", path.name)
+        finally:
+            if not delegated:
+                self.finish(path)
 
-    for item in os.listdir(SOURCE_DIR):
-        file_path = os.path.join(SOURCE_DIR, item)
-        if os.path.isfile(file_path) and item.lower().endswith(IMAGE_EXTENSIONS):
-            logging.info(f"Found existing loose file: {item}")
+    def resolve_and_move(self, path, expected, title, route):
+        try:
+            if fingerprint(path) != expected:
+                return
             try:
-                process_file(file_path)
-            except Exception as e:
-                logging.error(f"Unhandled error processing existing file {file_path}: {e}")
+                route = self.flash.resolve(title, path, route)
+            except Exception:
+                logger.exception(
+                    "Flash unavailable; using local route for %s", path.name
+                )
+            self.move(path, expected, route)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.exception("Could not file %s; will retry", path.name)
+        finally:
+            self.finish(path)
+
+    def move(self, path, expected, route):
+        target = move_capture(
+            path, destination(self.root, self.unsorted, route), expected
+        )
+        if target:
+            logger.info("Moved %s -> %s (%s)", path.name, target, route.reason)
+
+    def close(self):
+        self.local_worker.shutdown(wait=True)
+        self.ai_worker.shutdown(wait=True)
 
 
-def main():
-    setup_logging()
-
-    import sys
-    def handle_exception(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        logging.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
-
-    sys.excepthook = handle_exception
-
-    logging.info(f"Starting Greenshot Sorter. Monitoring: {SOURCE_DIR}")
-
-    process_existing_files()
-
-    event_handler = ScreenshotHandler()
-    observer = Observer()
-    # recursive=False ensures we only monitor the root directory, not subfolders
-    observer.schedule(event_handler, SOURCE_DIR, recursive=False)
-    observer.start()
-
+@contextmanager
+def single_watcher(root):
+    if os.name != "nt":
+        yield True
+        return
+    name = hashlib.sha256(os.path.normcase(str(root)).encode()).hexdigest()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateMutexW
+    create.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    create.restype = wintypes.HANDLE
+    mutex = create(None, False, "Local\\GreenshotSorter-" + name)
+    if not mutex:
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
+        yield ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+    finally:
+        kernel.CloseHandle(wintypes.HANDLE(mutex))
+
+
+def watch(root, unsorted, router):
+    from flash_classifier import FlashClassifier
+
+    enabled = os.getenv("GREENSHOT_FLASH", "1").lower() not in {"0", "off", "false"}
+    inbox = Inbox(root, unsorted, router, FlashClassifier(router) if enabled else None)
+    observer = Observer()
+    observer.schedule(inbox, str(root), recursive=False)
+    observer.start()
+    try:
+        logger.info(
+            "Watching %s (Flash %s)", root, "enabled" if enabled else "disabled"
+        )
         while True:
-            time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Stopping Greenshot Sorter (Interrupt/Exit signal received)")
-    except Exception as e:
-        logging.error(f"Fatal error in main loop: {e}", exc_info=True)
+            inbox.scan()
+            time.sleep(30)  # Recover from locks, replacements and missed OS events.
+    except KeyboardInterrupt:
+        pass
     finally:
         observer.stop()
         observer.join()
-        logging.info("Greenshot Sorter stopped.")
+        inbox.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--preview-archive",
+        type=Path,
+        nargs="?",
+        const=SOURCE_DIR,
+        help="preview local routes, defaulting to the configured archive",
+    )
+    parser.add_argument(
+        "--report", type=Path, help="new preview CSV outside the archive"
+    )
+    args = parser.parse_args()
+    root = (args.preview_archive or SOURCE_DIR).resolve()
+    unsorted = Path(os.getenv("GREENSHOT_UNSORTED_DIR", root / "Unsorted")).resolve()
+    if root.is_relative_to(unsorted):
+        parser.error("Unsorted must be a subfolder of, or separate from, the inbox")
+    corrections = Path(os.getenv("GREENSHOT_CORRECTIONS", PROJECT / "corrections.json"))
+    if args.preview_archive:
+        if not root.is_dir():
+            parser.error("archive directory does not exist")
+        router = Routing(root, corrections if corrections.exists() else None)
+        if args.report:
+            report = args.report.resolve()
+            if any(
+                report.is_relative_to(p) for p in (root, unsorted, SOURCE_DIR.resolve())
+            ):
+                parser.error("report must be outside the archive and Unsorted")
+            with report.open("x", newline="", encoding="utf-8-sig") as stream:
+                counts = preview(root, unsorted, router, stream)
+        else:
+            sys.stdout.reconfigure(errors="backslashreplace")
+            counts = preview(root, unsorted, router, sys.stdout)
+        print(
+            f"{counts['images']} images, {counts['different folder']} different folders, "
+            f"{counts['needs Flash']} need Flash, 0 model calls.",
+            file=sys.stderr,
+        )
+        return
+    if args.report:
+        parser.error("--report requires --preview-archive")
+    with single_watcher(root) as acquired:
+        if acquired:
+            root.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            )
+            logging.basicConfig(
+                level=logging.INFO,
+                handlers=[handler],
+                format="%(asctime)s - %(levelname)s - %(message)s",
+            )
+            router = Routing(root, corrections if corrections.exists() else None)
+            watch(root, unsorted, router)
 
 
 if __name__ == "__main__":

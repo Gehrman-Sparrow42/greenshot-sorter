@@ -1,0 +1,11 @@
+{
+  "exact_titles": {
+    "Example application window": ["Example Application"]
+  },
+  "series_aliases": {
+    "Example abbreviated series": "Example Series"
+  },
+  "site_aliases": {
+    "Example Reader": "Example Site"
+  }
+}

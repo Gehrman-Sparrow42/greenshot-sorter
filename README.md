@@ -1,122 +1,59 @@
-# greenshot-sorter
+# Greenshot Sorter
 
-An automated background file-system watcher that monitors screenshot output directories, parses naming patterns, and routes image files into categorized target directories.
+A Windows background watcher that files Greenshot captures from the top level of the screenshot archive. It uses the window title, optional personal corrections and, for ambiguous captures, Gemini Flash Medium through the official Antigravity CLI.
 
-## Overview
+## Where screenshots go
 
-Greenshot Sorter is a lightweight filesystem automation daemon for Windows environments. It continuously listens for newly captured Greenshot screenshots (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.webp`), parses filename metadata using regex and rule-based priority routing, and sorts incoming captures into project-, media-, or browser-specific subdirectories without human intervention.
+| Window title | New folder |
+| --- | --- |
+| Example Series Chapter 12 – MangaDex – Firefox | Browser / Manga / Example Series / Chapter 12 / MangaDex |
+| Example Series – MangaDex – Firefox | Browser / Manga / Example Series / MangaDex |
+| Bloodborne guide – YouTube – Firefox | Browser / Gaming / Bloodborne / YouTube |
+| A video – YouTube | Browser / Video / YouTube |
+| Example Show Episode 08 – PotPlayer | PotPlayer / Example Show |
+| shadPS4 | Bloodborne |
 
-## Architecture and Pipeline
+A browser name identifies the application. A site name needs its own evidence. Missing chapter and site levels are omitted. Browser captures with insufficient evidence go in `Browser/Unsorted`; other unresolved captures go in the configured Unsorted folder. Images with missing Greenshot timestamps or empty titles also use that folder. Original filenames are preserved, with a numeric suffix on collisions.
 
-The service utilizes an event-driven architecture based on native OS file notifications, combined with a lock-verification step to prevent race conditions during write completion.
+## Run or preview
 
-```mermaid
-flowchart LR
-    A[File Created in Watch Directory] --> B[Wait for File Handle Release]
-    B --> C[Sanitize Filename and OS Tokens]
-    C --> D{Evaluate Priority Rules}
-    D -->|Keyword Match| E[Route to Target Directory]
-    D -->|Media / Manga Pattern| E
-    D -->|Browser Fallback| E
-    D -->|No Match| F[Move to Unsorted Directory]
-    E --> G[Resolve Duplicate Name Collisions]
-    F --> G
-    G --> H[Atomic Move Operation]
-    H --> I[Append to Rotating Audit Log]
+Use the existing Greenshot Sorter launcher or run `start_sorter.bat`. To run from a console in this workspace:
+
+```powershell
+& C:\Tools\.venv\Scripts\python.exe C:\Tools\greenshot_sorter\sorter.py
 ```
 
-- Ingestion: `watchdog.observers.Observer` captures `FileCreatedEvent` notifications in the watch directory.
-- Concurrency and Lock Handling: The worker polls the target file handle via non-blocking read access until Windows completes the write buffer release.
-- Transformation and Parsing: Rule engines sanitize OS-restricted characters (`< > : " / \ | ? *`), normalize whitespace, strip browser/group noise, and extract canonical directory names.
-- Routing Engine:
-  - Priority 1: Direct keyword mapping (`CUSTOM_KEYWORDS`).
-  - Priority 2: Serialized media and manga chapter patterns with scanlation suffix truncation.
-  - Priority 3: Media player window captures (e.g., PotPlayer releases).
-  - Priority 4: Web browser signatures routed to a dedicated browser screenshots container.
-  - Fallback: Unmatched captures route to the `Unsorted` directory.
-- Storage: Moves files atomically using collision detection (`_1`, `_2` suffix increments) and writes audit entries via `RotatingFileHandler`.
+The watcher scans loose images on startup and periodically checks for files left open by their writer. It watches only the inbox root. Windows permits one watcher per resolved inbox per login session. Supported capture formats are PNG, JPEG, BMP and WebP.
 
-## Tech Stack
+To preview the existing archive, run the following in the project directory. The first command prints CSV rows. The second creates a new UTF-8 CSV at a path outside the archive. Choose a fresh report filename each time.
 
-| Component | Technology | Description |
-| :--- | :--- | :--- |
-| Runtime | Python 3.10+ | Primary script execution environment |
-| Event Watcher | watchdog (>= 3.0.0) | Cross-platform filesystem event monitoring |
-| Logging | logging.handlers.RotatingFileHandler | UTF-8 rotating audit logs (5 MB cap, 3 backups) |
-| System Layer | Windows Shell / VBScript | Headless daemon startup via `pythonw.exe` |
-
-## Project Structure
-
-```text
-greenshot_sorter/
-├── .env.example          # Sample environment configuration
-├── .gitignore            # Git exclusion rules
-├── README.md             # Technical documentation
-├── requirements.txt      # Python package manifest
-├── Run_Dashboard.vbs     # Silent background execution script (Windows)
-├── sorter.py             # Core file monitoring and routing daemon
-└── start_sorter.bat      # CLI batch launcher
+```powershell
+& C:\Tools\.venv\Scripts\python.exe sorter.py --preview-archive
+& C:\Tools\.venv\Scripts\python.exe sorter.py --preview-archive --report "$env:TEMP\greenshot-preview.csv"
 ```
 
-## Setup and Prerequisites
+The preview records the current folder, proposed folder, reason and whether a live capture would need Flash. It runs local rules only and leaves archived captures in place. A different folder may reflect a new layout or an earlier manual choice.
 
-### Prerequisites
-- Python 3.10 or higher
-- Windows 10/11 operating system
+## Teach the sorter a correction
 
-### Installation
+Copy `corrections.example.json` to `corrections.json`, edit it, then restart the watcher. Use `exact_titles` to map a complete window title to an array of folder names under the archive. Use `series_aliases` to map alternate series spellings to the same name while retaining the detected installment, or `site_aliases` to map alternate reader-site names. The local corrections file is excluded from Git.
 
-1. Clone or navigate to the project directory:
-   ```bash
-   cd c:/Tools/greenshot_sorter
-   ```
+## Flash fallback
 
-2. Create and activate an isolated virtual environment:
-   ```bash
-   python -m venv .venv
-   .venv\Scripts\activate
-   ```
+The watcher tries local rules first. An unresolved capture goes to a separate worker so new, recognizable screenshots can still be filed. The worker uses the official signed-in Antigravity CLI and selects `gemini-3.8-flash-medium`. It asks about the title before attaching an image. For unresolved inputs, visible labels in the screenshot can supply evidence. The Python sorter validates the proposed fields and chooses the destination. If the service times out or is unavailable, the capture uses its local fallback.
 
-3. Install production dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Archive preview and unit tests run without an Antigravity account. To use live Flash, install the official Windows CLI and sign in interactively under the same Windows user that runs the watcher. For local-only sorting, set `GREENSHOT_FLASH=0` in the launch environment.
 
-4. Configure environment variables:
-   ```bash
-   copy .env.example .env
-   ```
+## Settings
 
-Adjust the paths inside `.env` or set system variables if your screenshot directory differs from the default `GREENSHOT DB`.
+The sorter reads Windows environment variables at startup. `.env.example` lists examples; set the values in the environment used by the launcher.
 
-## Usage Examples
+| Variable | Default |
+| --- | --- |
+| `GREENSHOT_SOURCE_DIR` | `GREENSHOT DB` beside the project folder |
+| `GREENSHOT_UNSORTED_DIR` | `Unsorted` under the inbox |
+| `GREENSHOT_LOG_FILE` | `greenshot_sorter.log` beside the script |
+| `GREENSHOT_CORRECTIONS` | `corrections.json` beside the script, when present |
+| `GREENSHOT_FLASH` | `1` (enabled for live ambiguous captures) |
 
-### Foreground Execution (Console Mode)
-To run the watcher in the foreground with standard output:
-```bash
-python sorter.py
-```
-
-### Headless Execution (Background Daemon)
-To execute silently in the background without keeping a terminal window open:
-```bash
-wscript.exe Run_Dashboard.vbs
-```
-Alternatively, trigger the batch wrapper:
-```bash
-start_sorter.bat
-```
-
-### Configuration Environment Variables
-
-| Variable | Default Value | Description |
-| :--- | :--- | :--- |
-| `GREENSHOT_SOURCE_DIR` | `../GREENSHOT DB` | Root directory monitored for incoming screenshots |
-| `GREENSHOT_UNSORTED_DIR`| `$GREENSHOT_SOURCE_DIR/Unsorted` | Destination for files matching no priority rules |
-| `GREENSHOT_LOG_FILE` | `greenshot_sorter.log` | Destination path for rotating execution logs |
-
-## Notes and Constraints
-
-- Windows Lock Latency: If an external tool writes a large screenshot slowly, the script polls the file lock for up to 5.0 seconds before skipping to avoid hanging worker threads.
-- Startup Re-indexing: When `sorter.py` initializes, it runs a synchronous scan across the root watch folder to process any backlog images created while the process was offline.
-- Case Insensitivity: Filename matching rules are evaluated case-insensitively, but preserved folder names retain original casing when dynamically generated.
+Install `requirements.txt` in the Python environment running the launcher. Run the offline regression suite from the project directory with `python -m unittest discover -v`.
