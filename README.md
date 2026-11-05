@@ -2,6 +2,21 @@
 
 A Windows background watcher that files Greenshot captures from the top level of the screenshot archive. It uses the window title, optional personal corrections and, for ambiguous captures, Gemini Flash Medium through the official Antigravity CLI.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    A[New capture] --> B[Local title rules and corrections]
+    B --> C[Collision-safe move]
+    B -->|Ambiguous| D[Persistent daily queue]
+    D --> E[Flash title batch]
+    E -->|Evidence needed| F[Image request]
+    E --> G[Validate route and move]
+    F --> G
+    G -->|Unresolved or failed| D
+```
+
+Local rules file captures immediately; a separate worker revisits unresolved captures. Archive preview applies local rules without moving files. See [routing.py](routing.py), [sorter.py](sorter.py), [daily_batch.py](daily_batch.py), and [flash_classifier.py](flash_classifier.py) for the routing, watcher, scheduling, and model integration.
 ## Where screenshots go
 
 | Window title | New folder |
@@ -17,10 +32,11 @@ A browser name identifies the application. A site name needs its own evidence. M
 
 ## Run or preview
 
-Use the existing Greenshot Sorter launcher or run `start_sorter.bat`. To run from a console in this workspace:
+Install the dependencies and run from the repository directory:
 
 ```powershell
-& C:\Tools\.venv\Scripts\python.exe C:\Tools\greenshot_sorter\sorter.py
+python -m pip install -r requirements.txt
+python sorter.py
 ```
 
 The watcher scans loose images on startup and periodically checks for files left open by their writer. It watches only the inbox root. Windows permits one watcher per resolved inbox per login session. Supported capture formats are PNG, JPEG, BMP and WebP.
@@ -28,8 +44,8 @@ The watcher scans loose images on startup and periodically checks for files left
 To preview the existing archive, run the following in the project directory. The first command prints CSV rows. The second creates a new UTF-8 CSV at a path outside the archive. Choose a fresh report filename each time.
 
 ```powershell
-& C:\Tools\.venv\Scripts\python.exe sorter.py --preview-archive
-& C:\Tools\.venv\Scripts\python.exe sorter.py --preview-archive --report "$env:TEMP\greenshot-preview.csv"
+python sorter.py --preview-archive
+python sorter.py --preview-archive --report "$env:TEMP\greenshot-preview.csv"
 ```
 
 The preview records the current folder, proposed folder, reason and whether a live capture would need Flash. It runs local rules only and leaves archived captures in place. A different folder may reflect a new layout or an earlier manual choice.
