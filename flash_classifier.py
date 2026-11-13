@@ -97,7 +97,9 @@ def _request(
     timeout: float = 90,
 ) -> str:
     """Run one ACP turn with an isolated project and deny all client tool requests."""
-    with tempfile.TemporaryDirectory(prefix="greenshot-flash-") as folder:
+    with tempfile.TemporaryDirectory(
+        prefix="greenshot-flash-", ignore_cleanup_errors=True
+    ) as folder:
         root = Path(folder)
         _workspace(root)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

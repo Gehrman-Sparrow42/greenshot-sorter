@@ -30,8 +30,56 @@ from routing import Route, Routing
 logger = logging.getLogger(__name__)
 
 PROJECT = Path(__file__).resolve().parent
-SOURCE_DIR = Path(os.getenv("GREENSHOT_SOURCE_DIR", PROJECT.parent / "GREENSHOT DB"))
-LOG_FILE = Path(os.getenv("GREENSHOT_LOG_FILE", PROJECT / "greenshot_sorter.log"))
+
+
+def load_env_file(env_path: Path | None = None) -> dict[str, str]:
+    """Load KEY=VALUE pairs from .env without overriding explicit environment vars."""
+    path = env_path or (PROJECT / ".env")
+    loaded: dict[str, str] = {}
+    if not path.is_file():
+        return loaded
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        logger.warning("Could not read .env file %s: %s", path, exc)
+        return loaded
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        loaded[key] = value
+        os.environ.setdefault(key, value)
+    return loaded
+
+
+load_env_file()
+
+
+def _resolve_configured_path(env_name: str, default: Path) -> Path:
+    raw = os.getenv(env_name)
+    if not raw:
+        return default
+    candidate = Path(raw)
+    return candidate if candidate.is_absolute() else (PROJECT / candidate)
+
+
+SOURCE_DIR = _resolve_configured_path(
+    "GREENSHOT_SOURCE_DIR", PROJECT.parent / "GREENSHOT DB"
+)
+LOG_FILE = _resolve_configured_path(
+    "GREENSHOT_LOG_FILE", PROJECT / "greenshot_sorter.log"
+)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 CAPTURE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}[_:-]\d{2}[_:-]\d{2}\s*[-_]?\s*(.*)$")
 
@@ -47,8 +95,9 @@ def classify_file(path, router):
 def destination(root, unsorted, route):
     if not route.parts:
         return unsorted
-    folder = root.joinpath(*route.parts).resolve()
-    if not folder.is_relative_to(root) or folder == root:
+    root_resolved = Path(root).resolve()
+    folder = root_resolved.joinpath(*route.parts).resolve()
+    if not folder.is_relative_to(root_resolved) or folder == root_resolved:
         raise ValueError("Route leaves the archive or points back into the inbox")
     return folder
 
@@ -150,13 +199,29 @@ def stable_capture(path, timeout=5, interval=0.25):
     return None
 
 
-def publish_unique(source, folder, filename):
-    """Publish within a volume without replacing an existing capture."""
+MAX_TARGET_PATH_CHARS = 240
+
+
+def _bounded_target_name(folder, filename, index, max_path_chars=MAX_TARGET_PATH_CHARS):
     suffix = Path(filename).suffix
     stem = Path(filename).stem
+    collision = "" if index == 0 else f"_{index}"
+    if os.name == "nt":
+        budget = max_path_chars - (len(str(folder)) + 1) - len(collision) - len(suffix)
+        if budget < 1:
+            raise OSError(
+                errno.ENAMETOOLONG,
+                f"Destination folder path exceeds Windows path budget: {folder}",
+            )
+        stem = stem[:budget].rstrip(" .") or stem[:1]
+    return f"{stem}{collision}{suffix}"
+
+
+def publish_unique(source, folder, filename):
+    """Publish within a volume without replacing an existing capture."""
     index = 0
     while True:
-        target = folder / (filename if index == 0 else f"{stem}_{index}{suffix}")
+        target = folder / _bounded_target_name(folder, filename, index)
         try:
             if os.name == "nt":
                 # Windows rename fails if the target already exists.
@@ -249,8 +314,10 @@ class Inbox(FileSystemEventHandler):
             target = self.move(path, expected, route)
             if target and route.unresolved:
                 daily_batch.enqueue(self.root, target, title, route)
-        except FileNotFoundError:
-            pass
+        except FileNotFoundError as exc:
+            logger.warning("Capture vanished or path inaccessible while processing %s: %s", path.name, exc)
+        except OSError as exc:
+            logger.error("OS/path error processing %s: %s", path.name, exc)
         except Exception:
             logger.exception("Could not process %s; will retry", path.name)
         finally:

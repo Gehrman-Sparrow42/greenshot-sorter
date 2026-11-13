@@ -66,9 +66,17 @@ SITES = {
     "harimanga": "Harimanga",
     "toongod": "ToonGod",
     "hivetoon": "Hivetoon",
+    "nhentai": "nhentai",
 }
 BROWSERS = r"(?:Google Chrome|Chrome|Mozilla Firefox|Firefox|Microsoft Edge|Edge|Opera GX|Opera|Brave|Vivaldi|Arc|Zen Browser|Zen|Thorium|LibreWolf|Waterfox|Ablaze Floorp|Ablaze Fl|Ablaze|Floorp)"
-BROWSER_SUFFIX = re.compile(r"(?i)(?:\s*[-|–—_]\s*|^)" + BROWSERS + r"\s*$")
+TRUNCATED_BROWSERS = r"(?:Li(?:b(?:r(?:e(?:W(?:o(?:l(?:f)?)?)?)?)?)?)?|Fir(?:e(?:f(?:o(?:x)?)?)?)?|Chr(?:o(?:m(?:e)?)?)?|Edg(?:e)?|Bra(?:v(?:e)?)?|Ope(?:r(?:a(?:\s+GX)?)?)?|Viv(?:a(?:l(?:d(?:i)?)?)?)?|Flo(?:o(?:r(?:p)?)?)?|Wat(?:e(?:r(?:f(?:o(?:x)?)?)?)?)?|Zen(?:\s+Br(?:o(?:w(?:s(?:e(?:r)?)?)?)?)?)?)"
+BROWSER_SUFFIX = re.compile(
+    r"(?i)(?:(?:\s*[-|–—_]\s*|^)"
+    + BROWSERS
+    + r"|\s*[-|–—_]\s*"
+    + TRUNCATED_BROWSERS
+    + r")\s*$"
+)
 CHAPTER = re.compile(
     r"(?i)\b(chapter|episode|volume|vol|ch|ep|capitulo|cap)\.?\s*(\d+(?:[.]\d+)?)\b"
 )
@@ -194,19 +202,24 @@ class Routing:
             return Route(self.exact[_key(title)], "exact correction")
         if not title:
             return Route((), "empty title", True)
-        player = re.search(r"(?i)(?:\s*[-|–—_]\s*|^)potplayer\s*$", title)
+        player = re.search(
+            r"(?i)(?:(?:\s*[-|–—_]\s*|^)potplayer|\.(?:mkv|mp4|avi|webm|ts|flv)\s*[-|–—_]\s*(?:p(?:o(?:t(?:p(?:l(?:a(?:y(?:e(?:r)?)?)?)?)?)?)?)?)?)\s*$",
+            title,
+        )
         if player:
             name = title[: player.start()].strip()
             name = re.sub(r"(?i)\.(?:mkv|mp4|avi|webm|ts|flv)$", "", name)
             name = re.sub(r"^\[[^]]+\]\s*", "", name)
             name = re.sub(
-                r"(?i)(?:(?:\s*[-–—_]\s*|\s+)(?:s\d+\s*e\d+|episode\s*\d+|e\d+)|\s+[-–—_]\s+\d{2,3}(?:v\d+)?)\b.*$",
+                r"(?i)(?:(?:\s*[-–—_]\s*|[\s.]+)(?:s\d+\s*e\d+|episode\s*\d+|e\d+)|\s+[-–—_]\s+\d{2,3}(?:v\d+)?)\b.*$",
                 "",
                 name,
             )
             name = re.sub(
                 r"(?i)\s*(?:\[(?:\d{3,4}p|[xh]26[45]|hevc|[a-f\d]{8})\]\s*)+$", "", name
             )
+            if "." in name and " " not in name:
+                name = name.replace(".", " ")
             name = safe_component(name)
             return (
                 Route(("PotPlayer", name), "media player")
@@ -252,7 +265,7 @@ class Routing:
         if not is_web:
             # Long release names may be cut off before the player suffix.
             release = re.match(
-                r"(?i)^(.+?)\.S\d{1,2}E\d{1,3}\..*(?:\d{3,4}p|web[-.]dl|bluray|\.mkv)",
+                r"(?i)^(.+?)[.\s]S\d{1,2}E\d{1,3}(?:[.\s].*)?(?:\d{3,4}p|web[-.]?dl|bluray|h\.?26[45]|hevc|\.(?:mkv|mp4))",
                 title,
             )
             if release:
@@ -288,9 +301,9 @@ class Routing:
             body = web_title
             if site_alias:
                 body = re.sub(
-                    r"(?i)(?:^|\s*[-|–—_]\s*)"
+                    r"(?i)(?:^|\s*[-|–—_»]\s*)"
                     + re.escape(site_alias)
-                    + r"(?=$|\s*[-|–—_]).*$",
+                    + r"(?=$|\s*[-|–—_»]).*$",
                     "",
                     body,
                 ).strip()

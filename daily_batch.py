@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -52,6 +53,15 @@ def _save(state):
         os.replace(temporary, STATE_FILE)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+MAX_DAILY_FAILURES = 5
+RETRY_BACKOFF_BASE_SECONDS = 60
+RETRY_BACKOFF_MAX_SECONDS = 600
+
+
+def _now_ts(now=None):
+    return now.timestamp() if now is not None else time.time()
 
 
 def _root(state, root, date):
@@ -128,26 +138,63 @@ def recover(root, unsorted, router):
 def claim(root, *, now=None, force=False):
     """Claim the current day before work starts; return a snapshot, or None if not due."""
     date = today(now)
+    now_ts = _now_ts(now)
     with _LOCK:
         state = _load()
         key = str(Path(root).resolve())
         new_root = key not in state["roots"]
         entry = _root(state, root, date)
-        if not force and entry["last_run"] >= date:
-            if new_root:
-                _save(state)
-            return None
+        if not force:
+            if entry["last_run"] >= date or entry.get("retry_after", 0) > now_ts:
+                if new_root:
+                    _save(state)
+                return None
+        entry["previous_last_run"] = entry.get("last_run", "")
         entry["last_run"] = date
+        entry.pop("retry_after", None)
         pending = dict(entry["pending"])
         _save(state)
         return pending
 
 
-def run(root, unsorted, router, pending, classifier):
-    """Process a claimed snapshot, retaining failed or unresolved entries for tomorrow."""
+def _mark_run_complete(root, date):
+    with _LOCK:
+        state = _load()
+        entry = _root(state, root, date)
+        entry.pop("previous_last_run", None)
+        entry.pop("retry_after", None)
+        entry["failures"] = 0
+        entry["last_run"] = date
+        _save(state)
+
+
+def _release_failed_claim(root, date, *, now=None):
+    now_ts = _now_ts(now)
+    with _LOCK:
+        state = _load()
+        entry = _root(state, root, date)
+        prev = entry.pop("previous_last_run", "")
+        failures = int(entry.get("failures", 0)) + 1
+        entry["failures"] = failures
+        if failures < MAX_DAILY_FAILURES:
+            entry["last_run"] = prev if prev < date else ""
+            delay = min(
+                RETRY_BACKOFF_MAX_SECONDS,
+                RETRY_BACKOFF_BASE_SECONDS * (2 ** (failures - 1)),
+            )
+            entry["retry_after"] = now_ts + delay
+        else:
+            entry["last_run"] = date
+            entry.pop("retry_after", None)
+        _save(state)
+
+
+def run(root, unsorted, router, pending, classifier, *, now=None):
+    """Process a claimed snapshot, retaining failed or unresolved entries for retry."""
     # Imported here to keep the queue usable independently of the watcher.
     from sorter import destination, fingerprint, move_capture, regular_entry
 
+    date = today(now)
     items = []
     for name, item in pending.items():
         path = Path(name)
@@ -170,20 +217,33 @@ def run(root, unsorted, router, pending, classifier):
             logger.exception("Cannot inspect queued capture %s; will retry", path)
             continue
         items.append((name, item))
-    for start in range(0, len(items), 30):
-        group = items[start : start + 30]
-        if not classifier.prepare_titles(item["title"] for _, item in group):
-            return
-        _process_group(
-            root,
-            unsorted,
-            group,
-            classifier,
-            destination,
-            fingerprint,
-            move_capture,
-            regular_entry,
-        )
+    if not items:
+        _mark_run_complete(root, date)
+        return
+    try:
+        for start in range(0, len(items), 30):
+            group = items[start : start + 30]
+            if not classifier.prepare_titles(item["title"] for _, item in group):
+                _release_failed_claim(root, date, now=now)
+                return
+            _process_group(
+                root,
+                unsorted,
+                group,
+                classifier,
+                destination,
+                fingerprint,
+                move_capture,
+                regular_entry,
+            )
+            retry_at = getattr(classifier, "retry_at", 0)
+            if isinstance(retry_at, (int, float)) and retry_at > time.monotonic():
+                _release_failed_claim(root, date, now=now)
+                return
+        _mark_run_complete(root, date)
+    except Exception:
+        _release_failed_claim(root, date, now=now)
+        raise
 
 
 def _process_group(
